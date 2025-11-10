@@ -1,393 +1,195 @@
-# ai.py  (Pygame UI + Minimax Alpha-Beta, depth 1|3|5)
-import sys
-import socket
-import threading
-import json
-import time
-import argparse
-import random
-from typing import List, Tuple, Optional, Set, Deque
-from collections import deque
-
 import pygame
+import sys
+import socket, threading, json
 
-# ---------- CLI ----------
-parser = argparse.ArgumentParser(
-    description="Co Ganh AI with UI (Minimax + Alpha-Beta). Use --depth 1|3|5."
-)
-parser.add_argument("--server-ip", default="127.0.0.1")
-parser.add_argument("--server-port", type=int, default=5555)
-parser.add_argument("--color", choices=["red", "blue"], required=True)
-parser.add_argument("--depth", type=int, choices=[1,3,5], default=3)
-parser.add_argument("--delay", type=float, default=0.25, help="Think time per move (seconds)")
-parser.add_argument("--startup-wait", type=float, default=0.8, help="Delay before first move to let the other client connect")
-args = parser.parse_args()
+# ==== Cấu hình mạng ====
+SERVER_IP = "127.0.0.1"  # 🧠 đổi thành IP VPS hoặc LAN server
+SERVER_PORT = 5555
 
-# ---------- Colors ----------
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect((SERVER_IP, SERVER_PORT))
+
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
-GRAY  = (180, 180, 180)
-RED   = (220, 50, 50)
-BLUE  = (50, 80, 220)
+GRAY = (180, 180, 180)
+RED = (220, 50, 50)
+BLUE = (50, 80, 220)
 GREEN = (0, 200, 0)
-LOCAL_COLOR = RED if args.color == "red" else BLUE
 
-# ---------- Board / Graph (5x5, giống client) ----------
-SIZE = 5
-def index(r, c): return r * SIZE + c
+# Người 1 luôn là Đỏ, người 2 là Xanh
+local_color = RED  # máy 1 để RED
+turn = {"color": RED}
+selected_piece = None
 
-# các cạnh hợp lệ: ngang, dọc, chéo nếu (r+c) chẵn
-CONN = set()
-for r in range(SIZE):
-    for c in range(SIZE):
-        i = index(r, c)
-        if c + 1 < SIZE:
-            CONN.add((i, index(r, c + 1))); CONN.add((index(r, c + 1), i))
-        if r + 1 < SIZE:
-            CONN.add((i, index(r + 1, c))); CONN.add((index(r + 1, c), i))
-        if (r + c) % 2 == 0:
-            if r + 1 < SIZE and c + 1 < SIZE:
-                CONN.add((i, index(r + 1, c + 1))); CONN.add((index(r + 1, c + 1), i))
-            if r + 1 < SIZE and c - 1 >= 0:
-                CONN.add((i, index(r + 1, c - 1))); CONN.add((index(r + 1, c - 1), i))
-
-def neighbors(pos: int) -> List[int]:
-    return [b for (a,b) in CONN if a == pos]
-
-def are_connected(a: int, b: int) -> bool:
-    return (a, b) in CONN
-
-def rc(i: int) -> Tuple[int,int]:
-    return (i // SIZE, i % SIZE)
-
-# ---------- State đồng bộ với server ----------
+# ✅ Thêm Lock để đồng bộ dữ liệu giữa các thread
 turn_lock = threading.Lock()
 pieces_lock = threading.Lock()
 
-turn = {"color": RED}  # RED đi trước theo mặc định
+# Quân cờ: danh sách gồm (vị trí, màu)
 pieces = [
-    # BLUE (trên)
+    # Xanh (người 2) - phía trên
     {"pos": 0, "color": BLUE}, {"pos": 1, "color": BLUE}, {"pos": 2, "color": BLUE},
-    {"pos": 3, "color": BLUE}, {"pos": 4, "color": BLUE}, {"pos": 5, "color": BLUE},
+    {"pos": 3, "color": BLUE}, {"pos": 4, "color": BLUE}, {"pos": 5, "color": BLUE}, 
     {"pos": 9, "color": BLUE}, {"pos": 14, "color": BLUE},
-    # RED (dưới)
+    # Đỏ (người 1) - phía dưới
     {"pos": 10, "color": RED}, {"pos": 15, "color": RED}, {"pos": 19, "color": RED},
     {"pos": 20, "color": RED}, {"pos": 21, "color": RED}, {"pos": 22, "color": RED},
     {"pos": 23, "color": RED}, {"pos": 24, "color": RED},
 ]
 
-# ---------- Socket ----------
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect((args.server_ip, args.server_port))
-print(f"[AI] Connected to {args.server_ip}:{args.server_port} as {args.color.upper()} | depth={args.depth}")
-
-# ---------- Pygame UI ----------
-pygame.init()
-WIDTH, HEIGHT = 360, 360
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption(f"Cờ gánh - AI {args.color.upper()} (depth={args.depth})")
-size = 5
-cell_size = WIDTH // (size + 1)
-offset = cell_size
-
-positions_xy = []
-for r in range(size):
-    for c in range(size):
-        x = offset + c * cell_size
-        y = offset + r * cell_size
-        positions_xy.append((x, y))
-
-connections = []
-def idx(r, c): return r * size + c
-for r in range(size):
-    for c in range(size):
-        i = idx(r, c)
-        if c + 1 < size:
-            connections.append((i, idx(r, c + 1)))
-        if r + 1 < size:
-            connections.append((i, idx(r + 1, c)))
-        if (r + c) % 2 == 0:
-            if r + 1 < size and c + 1 < size:
-                connections.append((i, idx(r + 1, c + 1)))
-            if r + 1 < size and c - 1 >= 0:
-                connections.append((i, idx(r + 1, c - 1)))
-
-def draw_board():
-    screen.fill(WHITE)
-    # lines
-    for a, b in connections:
-        pygame.draw.line(screen, BLACK, positions_xy[a], positions_xy[b], 2)
-    # nodes
-    for i, (x, y) in enumerate(positions_xy):
-        pygame.draw.circle(screen, BLACK, (x, y), 6)
-    # pieces
-    with pieces_lock:
-        for p in pieces:
-            x, y = positions_xy[p["pos"]]
-            pygame.draw.circle(screen, p["color"], (x, y), 20)
-    # turn text
-    font = pygame.font.SysFont(None, 20)
-    with turn_lock:
-        tcol = turn["color"]
-    label = "RED" if tcol == RED else "BLUE"
-    txt = font.render(f"Turn: {label}", True, BLACK)
-    screen.blit(txt, (10, HEIGHT - 24))
-    pygame.display.flip()
-
-# ---------- Board helpers for AI ----------
-# 1 = RED, -1 = BLUE, 0 = trống
-def board_from_pieces() -> List[int]:
-    b = [0]*25
-    with pieces_lock:
-        for p in pieces:
-            b[p["pos"]] = 1 if p["color"] == RED else -1
-    return b
-
-def color_to_player(color: Tuple[int,int,int]) -> int:
-    return 1 if color == RED else -1
-
-def legal_moves_board(b: List[int], player: int) -> List[Tuple[int,int]]:
-    occ = {i for i,v in enumerate(b) if v != 0}
-    my  = [i for i,v in enumerate(b) if v == player]
-    moves=[]
-    for src in my:
-        for dst in neighbors(src):
-            if dst not in occ:
-                moves.append((src, dst))
-    return moves
-
-# ---------- LUẬT (áp dụng cho AI search nội bộ): Gánh + Chẹt ----------
-AXES = [(0,1), (1,0), (1,1), (1,-1)]
-
-def try_ganh(nb: List[int], dst: int, me: int) -> None:
-    opp = -me
-    dr, dc = rc(dst)
-    for (drd, dcd) in AXES:
-        ar, ac = dr - drd, dc - dcd
-        cr, cc = dr + drd, dc + dcd
-        if 0 <= ar < SIZE and 0 <= ac < SIZE and 0 <= cr < SIZE and 0 <= cc < SIZE:
-            a = ar*SIZE + ac
-            c = cr*SIZE + cc
-            if are_connected(a, dst) and are_connected(dst, c):
-                if nb[a] == opp and nb[c] == opp:
-                    nb[a] = me
-                    nb[c] = me
-
-def group_and_liberty(nb: List[int], start: int) -> Tuple[Set[int], bool]:
-    color = nb[start]
-    q: Deque[int] = deque([start])
-    group: Set[int] = set([start])
-    has_liberty = False
-    while q:
-        u = q.popleft()
-        for v in neighbors(u):
-            if nb[v] == 0:
-                has_liberty = True
-            elif nb[v] == color and v not in group:
-                group.add(v)
-                q.append(v)
-    return group, has_liberty
-
-def try_chet(nb: List[int], me: int) -> None:
-    opp = -me
-    visited: Set[int] = set()
-    for i, v in enumerate(nb):
-        if v == opp and i not in visited:
-            grp, lib = group_and_liberty(nb, i)
-            visited |= grp
-            if not lib:
-                for u in grp:
-                    nb[u] = me
-
-def apply_move_with_rules(b: List[int], move: Tuple[int,int], me: int) -> List[int]:
-    src, dst = move
-    nb = b[:]
-    nb[src] = 0
-    nb[dst] = me
-    try_ganh(nb, dst, me)
-    try_chet(nb, me)
-    return nb
-
-# ---------- Evaluation (heuristic) ----------
-CENTER=(2,2)
-W_MATERIAL=2.0
-W_CENTER=0.6
-W_GANH=1.2
-W_MOBILITY=0.15
-
-def center_score_for_player(b, player):
-    cr,cc=CENTER; s=0.0
-    for i,v in enumerate(b):
-        if v==player:
-            r,c=rc(i); s += -(abs(r-cr)+abs(c-cc))
-    return s
-
-def potential_ganh_targets(b: List[int], player: int) -> int:
-    opp=-player; cnt=0
-    empties=[i for i,v in enumerate(b) if v==0]
-    for e in empties:
-        er,ec=rc(e)
-        for drd,dcd in AXES:
-            ar,ac=er-drd, ec-dcd
-            cr,cc=er+drd, ec+dcd
-            if 0<=ar<SIZE and 0<=ac<SIZE and 0<=cr<SIZE and 0<=cc<SIZE:
-                a=ar*SIZE+ac; c=cr*SIZE+cc
-                if are_connected(a,e) and are_connected(e,c) and b[a]==opp and b[c]==opp:
-                    cnt += 1
-    return cnt
-
-def evaluate(b: List[int], player_view: int) -> float:
-    my = sum(1 for v in b if v==player_view)
-    op = sum(1 for v in b if v==-player_view)
-    material = (my-op)*W_MATERIAL
-    center   = (center_score_for_player(b,player_view)-center_score_for_player(b,-player_view))*W_CENTER
-    ganh     = (potential_ganh_targets(b,player_view)-potential_ganh_targets(b,-player_view))*W_GANH
-    mob      = (len(legal_moves_board(b,player_view))-len(legal_moves_board(b,-player_view)))*W_MOBILITY
-    return material + center + ganh + mob
-
-# ---------- Minimax + Alpha-Beta ----------
-def minimax(b: List[int], depth: int, player_to_move: int, player_view: int,
-            alpha: float, beta: float) -> Tuple[float, Optional[Tuple[int,int]]]:
-    if depth == 0:
-        return evaluate(b, player_view), None
-
-    moves = legal_moves_board(b, player_to_move)
-    if not moves:
-        return evaluate(b, player_view), None
-
-    # Move ordering: gần trung tâm khi maximize, xa khi minimize
-    if player_to_move == player_view:
-        moves.sort(key=lambda mv: -(abs(rc(mv[1])[0]-2)+abs(rc(mv[1])[1]-2)))
-        best_move=None
-        val=-1e18
-        for mv in moves:
-            nb = apply_move_with_rules(b, mv, player_to_move)
-            sc,_ = minimax(nb, depth-1, -player_to_move, player_view, alpha, beta)
-            if sc > val:
-                val = sc; best_move = mv
-            alpha = max(alpha, val)
-            if beta <= alpha: break
-        return val, best_move
-    else:
-        moves.sort(key=lambda mv: (abs(rc(mv[1])[0]-2)+abs(rc(mv[1])[1]-2)))
-        best_move=None
-        val=1e18
-        for mv in moves:
-            nb = apply_move_with_rules(b, mv, player_to_move)
-            sc,_ = minimax(nb, depth-1, -player_to_move, player_view, alpha, beta)
-            if sc < val:
-                val = sc; best_move = mv
-            beta = min(beta, val)
-            if beta <= alpha: break
-        return val, best_move
-
-def choose_move_by_depth(depth: int) -> Optional[Tuple[int,int]]:
-    b = board_from_pieces()
-    player = color_to_player(LOCAL_COLOR)
-    legal = legal_moves_board(b, player)
-    if not legal: return None
-    _, mv = minimax(b, depth, player, player, -1e18, 1e18)
-    return mv or random.choice(legal)
-
-# ---------- Network listener ----------
+# ==== Lắng nghe luồng từ server ====
 def listen_server():
     global pieces, turn
     while True:
         try:
             data = sock.recv(1024)
-            if not data: break
+            if not data:
+                break
             move = json.loads(data.decode())
-            # cập nhật棋
+            
+            # ✅ Sử dụng lock khi cập nhật pieces
             with pieces_lock:
-                if move.get("from",-1)!=-1 and move.get("to",-1)!=-1:
-                    for p in pieces:
-                        if p["pos"] == move["from"]:
-                            p["pos"] = move["to"]
-                            break
-            # cập nhật lượt
+                for p in pieces:
+                    if p["pos"] == move["from"]:
+                        p["pos"] = move["to"]
+                        break
+            
+            # ✅ Sử dụng lock khi cập nhật turn
+            # Chuyển list từ JSON về tuple
             with turn_lock:
-                nxt = move.get("next_turn", None)
-                if isinstance(nxt, list):
-                    nxt = tuple(nxt)
-                turn["color"] = nxt
-            # print(f"[AI][RECV] {move}")
+                turn["color"] = tuple(move["next_turn"]) if isinstance(move["next_turn"], list) else move["next_turn"]
+            
+            print(f"[RECEIVE] {move}")
+
         except Exception as e:
-            print(f"[AI][ERROR listen] {e}")
+            print(f"[ERROR] {e}")
             break
 
 threading.Thread(target=listen_server, daemon=True).start()
 
-# ---------- Main loop (UI + AI) ----------
+pygame.init()
+WIDTH, HEIGHT = 300, 300
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Cờ gánh - RED Client")
+
+# ==== BẢNG 5x5 ====
+size = 5
+cell_size = WIDTH // (size + 1)
+offset = cell_size
+
+positions = []
+for r in range(size):
+    for c in range(size):
+        x = offset + c * cell_size
+        y = offset + r * cell_size
+        positions.append((x, y))
+
+# ==== SINH CONNECTIONS ====
+connections = []
+def index(r, c): return r * size + c
+
+for r in range(size):
+    for c in range(size):
+        i = index(r, c)
+        # phải
+        if c + 1 < size:
+            connections.append((i, index(r, c + 1)))
+        # xuống
+        if r + 1 < size:
+            connections.append((i, index(r + 1, c)))
+        # chéo nếu r + c chẵn
+        if (r + c) % 2 == 0:
+            if r + 1 < size and c + 1 < size:
+                connections.append((i, index(r + 1, c + 1)))
+            if r + 1 < size and c - 1 >= 0:
+                connections.append((i, index(r + 1, c - 1)))
+
+# ==== VẼ BoardGame ====
+def draw_board():
+    screen.fill(WHITE)
+    # vẽ các line từ connections
+    for a, b in connections:
+        pygame.draw.line(screen, BLACK, positions[a], positions[b], 2)
+
+    # vẽ các điểm giao
+    for i, (x, y) in enumerate(positions):
+        pygame.draw.circle(screen, BLACK, (x, y), 6)
+    
+    # ✅ Sử dụng lock khi đọc pieces
+    with pieces_lock:
+        for p in pieces:
+            x, y = positions[p["pos"]]
+            pygame.draw.circle(screen, p["color"], (x, y), 22)
+            if p == selected_piece:
+                pygame.draw.circle(screen, GREEN, (x, y), 26, 3)
+    
+    pygame.display.flip()
+
+def get_piece_at_pos(mouse_pos):
+    # ✅ Sử dụng lock khi đọc pieces
+    with pieces_lock:
+        for p in pieces:
+            x, y = positions[p["pos"]]
+            if (mouse_pos[0]-x)**2 + (mouse_pos[1]-y)**2 < 22**2:
+                return p
+    return None
+
+def is_connected(pos1, pos2):
+    return (pos1, pos2) in connections or (pos2, pos1) in connections
+
+# ==== MAIN LOOP ====
 clock = pygame.time.Clock()
-last_move_time = 0.0
-first_move_hold = True
+while True:
+    draw_board()
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            pygame.quit()
+            sys.exit()
 
-try:
-    while True:
-        # UI events
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            # ✅ Sử dụng lock khi kiểm tra turn
+            with turn_lock:
+                current_turn = turn["color"]
+            
+            if current_turn != local_color:
+                continue  # không đến lượt mình
 
-        draw_board()
+            mouse_pos = pygame.mouse.get_pos()
+            clicked_piece = get_piece_at_pos(mouse_pos)
 
-        # AI move?
-        with turn_lock:
-            current_turn = turn["color"]
-
-        if current_turn == LOCAL_COLOR:
-            now = time.time()
-            # chờ startup để client kia kịp vào trước nước đầu
-            if first_move_hold:
-                if now - last_move_time < max(0.0, args.startup_wait):
-                    pass
-                else:
-                    first_move_hold = False
-            else:
-                # think time
-                if now - last_move_time >= max(0.0, args.delay):
-                    mv = choose_move_by_depth(args.depth)
-                    if mv is None:
-                        # không có nước → nhường lượt
-                        next_turn = RED if current_turn == BLUE else BLUE
-                        payload = {"from": -1, "to": -1, "next_turn": list(next_turn)}
-                        try:
-                            sock.sendall(json.dumps(payload).encode())
-                            with turn_lock:
-                                turn["color"] = next_turn
-                        except Exception as e:
-                            print(f"[AI][SEND ERROR skip] {e}")
-                    else:
-                        src, dst = mv
-                        # optimistic local update (UI sẽ thấy ngay)
+            if selected_piece:
+                # thử di chuyển
+                for i, (x, y) in enumerate(positions):
+                    if (mouse_pos[0]-x)**2 + (mouse_pos[1]-y)**2 < 22**2:
+                        # ✅ Kiểm tra ô trống với lock
                         with pieces_lock:
-                            for p in pieces:
-                                if p["color"] == LOCAL_COLOR and p["pos"] == src:
-                                    p["pos"] = dst
-                                    break
-                        next_turn = RED if current_turn == BLUE else BLUE
-                        payload = {"from": src, "to": dst, "next_turn": list(next_turn)}
-                        try:
-                            sock.sendall(json.dumps(payload).encode())
-                            print(f"[AI][SEND] {payload} | depth={args.depth}")
-                            with turn_lock:
-                                turn["color"] = next_turn
-                        except Exception as e:
-                            print(f"[AI][SEND ERROR] {e}")
-                            # revert nếu cần
+                            occupied = any(p["pos"] == i for p in pieces)
+                        
+                        if not occupied and is_connected(selected_piece["pos"], i):
+                            old_pos = selected_piece["pos"]
+                            
+                            # ✅ Cập nhật vị trí với lock
                             with pieces_lock:
-                                for p in pieces:
-                                    if p["color"] == LOCAL_COLOR and p["pos"] == dst:
-                                        p["pos"] = src
-                                        break
-                    last_move_time = now
+                                selected_piece["pos"] = i
+                            
+                            next_turn = RED if current_turn == BLUE else BLUE
 
-        clock.tick(60)
-
-except KeyboardInterrupt:
-    pass
-finally:
-    try: sock.close()
-    except: pass
-    pygame.quit()
-    print("[AI] Quit.")
+                            move = {"from": old_pos, "to": i, "next_turn": list(next_turn)}  # ✅ Chuyển tuple sang list để JSON serialize
+                            
+                            try:
+                                sock.sendall(json.dumps(move).encode())
+                                print(f"[SEND] {move}")
+                                
+                                # ✅ Cập nhật turn với lock
+                                with turn_lock:
+                                    turn["color"] = next_turn
+                            except Exception as e:
+                                print(f"[SEND ERROR] {e}")
+                        
+                        selected_piece = None
+                        break
+            else:
+                if clicked_piece and clicked_piece["color"] == local_color:
+                    selected_piece = clicked_piece
+    
+    clock.tick(60)  # ✅ Giới hạn FPS để giảm tải CPU
