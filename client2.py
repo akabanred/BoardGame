@@ -21,6 +21,7 @@ BLUE_COLOR = (50, 80, 220)
 GREEN = (0, 170, 0)
 MUTED = (115, 120, 130)
 PANEL = (245, 248, 252)
+OVERLAY = (0, 0, 0)
 
 # ==== Setup Game Logic ====
 game = CoGanh()
@@ -29,6 +30,8 @@ game_lock = threading.Lock()
 # Người 2: BLUE
 local_token = TOKEN_BLUE
 selected_node = None
+paused = False
+pause_btn = None
 
 # ==== Setup Socket ====
 try:
@@ -75,6 +78,21 @@ for r in range(SIZE):
         positions.append((x, y))
 
 
+def set_pause_state(value, *, remote):
+    """Updates shared pause state and UI."""
+    global paused, selected_node
+    if paused == value:
+        return
+    paused = value
+    with game_lock:
+        selected_node = None
+    if pause_btn is not None:
+        pause_btn.set_text("Continue" if paused else "Pause")
+    source = "REMOTE" if remote else "LOCAL"
+    state = "PAUSED" if paused else "RESUMED"
+    print(f"[{source}] {state}")
+
+
 # ==== Network Listener ====
 def listen_server():
     global game
@@ -85,15 +103,22 @@ def listen_server():
                 break
 
             msg = json.loads(data.decode())
-            src = msg["from"]
-            dst = msg["to"]
-            color = msg["color"]
+            msg_type = msg.get("type", "move")
 
-            with game_lock:
-                game.apply_move(src, dst, color)
-                game.turn = TOKEN_RED if color == TOKEN_BLUE else TOKEN_BLUE
+            if msg_type == "move":
+                src = msg["from"]
+                dst = msg["to"]
+                color = msg["color"]
 
-            print(f"[OPPONENT] Moved {src} -> {dst}")
+                with game_lock:
+                    game.apply_move(src, dst, color)
+                    game.turn = TOKEN_RED if color == TOKEN_BLUE else TOKEN_BLUE
+
+                print(f"[OPPONENT] Moved {src} -> {dst}")
+            elif msg_type == "pause":
+                set_pause_state(bool(msg.get("value", False)), remote=True)
+            else:
+                print(f"[WARN] Unknown message: {msg}")
 
         except Exception as e:
             print(f"[NET ERROR] {e}")
@@ -110,6 +135,49 @@ title_f, font_b, font, tiny = load_fonts()
 clock = pygame.time.Clock()
 
 
+class Button:
+    def __init__(self, rect, text, on_click):
+        self.rect = pygame.Rect(rect)
+        self.text = text
+        self.on_click = on_click
+
+    def draw(self, surf):
+        mx, my = pygame.mouse.get_pos()
+        hover = self.rect.collidepoint(mx, my)
+        base = (234, 238, 245)
+        if hover:
+            base = (220, 226, 236)
+        pygame.draw.rect(surf, base, self.rect, border_radius=10)
+        pygame.draw.rect(surf, MUTED, self.rect, 2, border_radius=10)
+        txt = font.render(self.text, True, BLACK)
+        surf.blit(txt, txt.get_rect(center=self.rect.center))
+
+    def handle(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.rect.collidepoint(event.pos):
+                self.on_click()
+                return True
+        return False
+
+    def set_text(self, text):
+        self.text = text
+
+
+def toggle_pause():
+    global paused
+    new_state = not paused
+    set_pause_state(new_state, remote=False)
+    payload = {"type": "pause", "value": new_state}
+    try:
+        sock.sendall(json.dumps(payload).encode())
+    except Exception as exc:
+        print(f"[NET ERROR] Pause send failed: {exc}")
+
+
+pause_btn = Button((WIDTH - 416, 10, 110, 38), "Pause", toggle_pause)
+if paused:
+    pause_btn.set_text("Continue")
+
 def draw_board():
     screen.fill(WHITE)
 
@@ -125,7 +193,10 @@ def draw_board():
     p_str = "BLUE"  # Client 2 is BLUE
 
     # Render status text
-    sub = tiny.render(f"Lượt: {turn_str}   |   Bạn: {p_str}", True, MUTED)
+    status = f"Lượt: {turn_str}   |   Bạn: {p_str}"
+    if paused:
+        status += "   |   TẠM DỪNG"
+    sub = tiny.render(status, True, MUTED)
     screen.blit(sub, sub.get_rect(center=(WIDTH // 2, 58)))
 
     # Draw Lines
@@ -151,6 +222,8 @@ def draw_board():
 
 def handle_click(pos):
     global selected_node
+    if paused:
+        return
     mx, my = pos
 
     clicked_idx = -1
@@ -180,7 +253,7 @@ def handle_click(pos):
                 game.apply_move(start, end, local_token)
                 game.turn = TOKEN_RED
 
-                payload = {"from": start, "to": end, "color": local_token}
+                payload = {"type": "move", "from": start, "to": end, "color": local_token}
                 try:
                     sock.sendall(json.dumps(payload).encode())
                     print(f"[SENT] {payload}")
@@ -195,6 +268,25 @@ def handle_click(pos):
 
 
 while True:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            try:
+                sock.sendall(json.dumps({"type": "pause", "value": False}).encode())
+            except Exception:
+                pass
+            sock.close()
+            pygame.quit()
+            sys.exit()
+
+        if pause_btn.handle(event):
+            continue
+
+        if paused:
+            continue
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            handle_click(event.pos)
+
     draw_board()
 
     winner, reason = game.check_winner()
@@ -203,14 +295,15 @@ while True:
         res_surf = font_b.render(res_text, True, GREEN)
         screen.blit(res_surf, res_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
 
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            sock.close()
-            pygame.quit()
-            sys.exit()
-        elif event.type == pygame.MOUSEBUTTONDOWN:
-            if event.button == 1:
-                handle_click(event.pos)
+    if paused:
+        overlay = pygame.Surface((WIDTH, HEIGHT))
+        overlay.set_alpha(140)
+        overlay.fill(OVERLAY)
+        screen.blit(overlay, (0, 0))
+        paused_label = font_b.render("TẠM DỪNG", True, WHITE)
+        screen.blit(paused_label, paused_label.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+
+    pause_btn.draw(screen)
 
     pygame.display.flip()
     clock.tick(60)

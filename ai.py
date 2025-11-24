@@ -26,6 +26,7 @@ GRAY = (200, 205, 215)
 RED = (220, 50, 50)
 BLUE = (50, 80, 220)
 GREEN = (0, 170, 0)
+OVERLAY = (0, 0, 0)
 
 WIDTH, HEIGHT = 420, 540
 cell_size = 72
@@ -213,6 +214,11 @@ class Button:
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.rect.collidepoint(event.pos):
                 self.on_click()
+                return True
+        return False
+
+    def set_text(self, text):
+        self.text = text
 
 
 # -------------------- UI Functions --------------------
@@ -439,6 +445,16 @@ def run_game(player_token, ai_depth):
     selected = None
     turn_token = TOKEN_RED  # Red always starts
     ai_thinking = False
+    paused = False
+
+    pause_btn = Button((WIDTH - 416, 10, 110, 38), "Pause", lambda: None)
+
+    def toggle_pause():
+        nonlocal paused
+        paused = not paused
+        pause_btn.set_text("Continue" if paused else "Pause")
+
+    pause_btn.on_click = toggle_pause
 
     while True:
         # 1. Check Winner
@@ -454,15 +470,49 @@ def run_game(player_token, ai_depth):
         if winner:
             return result_screen(winner, reason, player_token, ai_depth)
 
-        draw_grid_and_pieces(game, turn_token, player_token, ai_depth)
+        # 3. Handle Events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return "MENU"
 
-        # 3. AI Turn
-        if turn_token != player_token and not ai_thinking:
+            if pause_btn.handle(event):
+                continue
+
+            if paused:
+                continue
+
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if turn_token != player_token:
+                    continue  # Not your turn
+
+                mx, my = event.pos
+                for i, (x, y) in enumerate(positions):
+                    if (mx - x) ** 2 + (my - y) ** 2 <= 24**2:
+                        if selected is None:
+                            if game.board[i] == player_token:
+                                selected = i
+                        else:
+                            valid_moves = game.get_legal_moves(player_token)
+                            is_valid = any(
+                                start == selected and end == i for start, end in valid_moves
+                            )
+
+                            if is_valid:
+                                game.apply_move(selected, i, player_token)
+                                turn_token = (
+                                    TOKEN_RED if player_token == TOKEN_BLUE else TOKEN_BLUE
+                                )
+                                selected = None
+                            else:
+                                if game.board[i] == player_token:
+                                    selected = i
+                                else:
+                                    selected = None
+                        break
+
+        # 4. AI Turn
+        if not paused and turn_token != player_token and not ai_thinking:
             ai_thinking = True
-            # Force a redraw so the user sees the state before AI pauses
-            pygame.display.flip()
-
-            # Run Minimax
             start_t = time.time()
             chosen_move = ai_minimax(game, turn_token, ai_depth)
             end_t = time.time()
@@ -473,60 +523,25 @@ def run_game(player_token, ai_depth):
             if chosen_move:
                 game.apply_move(chosen_move[0], chosen_move[1], turn_token)
 
-            # Switch Turn
             turn_token = TOKEN_RED if turn_token == TOKEN_BLUE else TOKEN_BLUE
             ai_thinking = False
 
-        # 4. Human Turn
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                return "MENU"
+        # 5. Render
+        draw_grid_and_pieces(game, turn_token, player_token, ai_depth)
 
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if turn_token != player_token:
-                    continue  # Not your turn
-
-                mx, my = event.pos
-                for i, (x, y) in enumerate(positions):
-                    # Check click collision with piece radius
-                    if (mx - x) ** 2 + (my - y) ** 2 <= 24**2:
-
-                        # Logic: Select or Move
-                        if selected is None:
-                            # Select own piece
-                            if game.board[i] == player_token:
-                                selected = i
-                        else:
-                            # Attempt to move
-                            # Check if 'i' is a valid neighbor and empty
-                            valid_moves = game.get_legal_moves(player_token)
-                            is_valid = False
-                            for start, end in valid_moves:
-                                if start == selected and end == i:
-                                    is_valid = True
-                                    break
-
-                            if is_valid:
-                                game.apply_move(selected, i, player_token)
-                                turn_token = (
-                                    TOKEN_RED
-                                    if player_token == TOKEN_BLUE
-                                    else TOKEN_BLUE
-                                )
-                                selected = None
-                            else:
-                                # If clicked another own piece, switch selection
-                                if game.board[i] == player_token:
-                                    selected = i
-                                else:
-                                    # Clicked invalid spot, deselect
-                                    selected = None
-                        break
-
-        # Highlight selection
         if selected is not None:
             x, y = positions[selected]
             pygame.draw.circle(screen, GREEN, (x, y), 28, 3)
+
+        if paused:
+            overlay = pygame.Surface((WIDTH, HEIGHT))
+            overlay.set_alpha(140)
+            overlay.fill(OVERLAY)
+            screen.blit(overlay, (0, 0))
+            paused_text = font_b.render("TẠM DỪNG", True, WHITE)
+            screen.blit(paused_text, paused_text.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+
+        pause_btn.draw(screen)
 
         pygame.display.flip()
         clock.tick(60)
