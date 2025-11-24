@@ -1,16 +1,3 @@
-"""
-ai.py
-
-Cờ Gánh 5x5 (local Play vs AI, không networking).
-- Font: dùng system font qua pygame.font.SysFont (không cần .ttf)
-- Luật: Gánh + Chẹt
-- AI: Random (depth=0) hoặc Minimax + Alpha-Beta (depth 1/3/5)
-- Phát hiện thắng/thua:
-    + Một bên HẾT QUÂN
-    + Bên tới lượt KHÔNG CÒN NƯỚC ĐI
-- Màn hình kết quả có: "Chơi lại" & "Quay về menu"
-"""
-
 import pygame
 import sys
 import random
