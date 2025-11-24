@@ -1,195 +1,219 @@
 import pygame
 import sys
-import socket, threading, json
+import socket
+import threading
+import json
+from game import CoGanh, TOKEN_RED, TOKEN_BLUE, SIZE, EMPTY
 
 # ==== Cấu hình mạng ====
-SERVER_IP = "127.0.0.1"  # 🧠 đổi thành IP VPS hoặc LAN server
+SERVER_IP = "127.0.0.1"
 SERVER_PORT = 5555
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect((SERVER_IP, SERVER_PORT))
+# ==== Config UI ====
+WIDTH, HEIGHT = 420, 540
+cell_size = 72
+header_h = 88
 
 WHITE = (255, 255, 255)
-BLACK = (0, 0, 0)
-GRAY = (180, 180, 180)
-RED = (220, 50, 50)
-BLUE = (50, 80, 220)
-GREEN = (0, 200, 0)
+BLACK = (20, 24, 33)
+RED_COLOR = (220, 50, 50)
+BLUE_COLOR = (50, 80, 220)
+GREEN = (0, 170, 0)
+MUTED = (115, 120, 130)
+PANEL = (245, 248, 252)
 
-# Người 1 luôn là Đỏ, người 2 là Xanh
-local_color = RED  # máy 1 để RED
-turn = {"color": RED}
-selected_piece = None
+# ==== Setup Game Logic ====
+game = CoGanh()
+game_lock = threading.Lock()
 
-# ✅ Thêm Lock để đồng bộ dữ liệu giữa các thread
-turn_lock = threading.Lock()
-pieces_lock = threading.Lock()
+# Người 1: RED
+local_token = TOKEN_RED
+selected_node = None
 
-# Quân cờ: danh sách gồm (vị trí, màu)
-pieces = [
-    # Xanh (người 2) - phía trên
-    {"pos": 0, "color": BLUE}, {"pos": 1, "color": BLUE}, {"pos": 2, "color": BLUE},
-    {"pos": 3, "color": BLUE}, {"pos": 4, "color": BLUE}, {"pos": 5, "color": BLUE}, 
-    {"pos": 9, "color": BLUE}, {"pos": 14, "color": BLUE},
-    # Đỏ (người 1) - phía dưới
-    {"pos": 10, "color": RED}, {"pos": 15, "color": RED}, {"pos": 19, "color": RED},
-    {"pos": 20, "color": RED}, {"pos": 21, "color": RED}, {"pos": 22, "color": RED},
-    {"pos": 23, "color": RED}, {"pos": 24, "color": RED},
-]
+# ==== Setup Socket ====
+try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((SERVER_IP, SERVER_PORT))
+    print(f"[CONNECTED] Connected to {SERVER_IP}:{SERVER_PORT} as RED")
+except Exception as e:
+    print(f"[ERROR] Could not connect: {e}")
+    sys.exit()
 
-# ==== Lắng nghe luồng từ server ====
+
+# ==== Fonts (Fix lỗi hiển thị tiếng Việt) ====
+def load_fonts():
+    candidates = ["Segoe UI", "Arial", "Helvetica", "Roboto", None]
+    for name in candidates:
+        try:
+            title_f = pygame.font.SysFont(name, 40, bold=True)
+            font_b = pygame.font.SysFont(name, 22, bold=True)
+            font = pygame.font.SysFont(name, 20)
+            tiny = pygame.font.SysFont(name, 16)
+            # Test render
+            _ = title_f.render("CỜ GÁNH", True, BLACK)
+            return title_f, font_b, font, tiny
+        except Exception:
+            continue
+    return (
+        pygame.font.SysFont(None, 40, bold=True),
+        pygame.font.SysFont(None, 22, bold=True),
+        pygame.font.SysFont(None, 20),
+        pygame.font.SysFont(None, 16),
+    )
+
+
+# ==== Geometry ====
+grid_w = (SIZE - 1) * cell_size
+grid_h = (SIZE - 1) * cell_size
+x0 = (WIDTH - grid_w) // 2
+y0 = header_h + ((HEIGHT - header_h) - grid_h) // 2
+
+positions = []
+for r in range(SIZE):
+    for c in range(SIZE):
+        x = x0 + c * cell_size
+        y = y0 + r * cell_size
+        positions.append((x, y))
+
+
+# ==== Network Listener ====
 def listen_server():
-    global pieces, turn
+    global game
     while True:
         try:
             data = sock.recv(1024)
             if not data:
                 break
-            move = json.loads(data.decode())
-            
-            # ✅ Sử dụng lock khi cập nhật pieces
-            with pieces_lock:
-                for p in pieces:
-                    if p["pos"] == move["from"]:
-                        p["pos"] = move["to"]
-                        break
-            
-            # ✅ Sử dụng lock khi cập nhật turn
-            # Chuyển list từ JSON về tuple
-            with turn_lock:
-                turn["color"] = tuple(move["next_turn"]) if isinstance(move["next_turn"], list) else move["next_turn"]
-            
-            print(f"[RECEIVE] {move}")
+
+            msg = json.loads(data.decode())
+            src = msg["from"]
+            dst = msg["to"]
+            color = msg["color"]
+
+            with game_lock:
+                game.apply_move(src, dst, color)
+                game.turn = TOKEN_RED if color == TOKEN_BLUE else TOKEN_BLUE
+
+            print(f"[OPPONENT] Moved {src} -> {dst}")
 
         except Exception as e:
-            print(f"[ERROR] {e}")
+            print(f"[NET ERROR] {e}")
             break
+
 
 threading.Thread(target=listen_server, daemon=True).start()
 
+# ==== Pygame Loop ====
 pygame.init()
-WIDTH, HEIGHT = 300, 300
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Cờ gánh - RED Client")
+pygame.display.set_caption("Cờ Gánh - Client 1 (RED)")
+title_f, font_b, font, tiny = load_fonts()
+clock = pygame.time.Clock()
 
-# ==== BẢNG 5x5 ====
-size = 5
-cell_size = WIDTH // (size + 1)
-offset = cell_size
 
-positions = []
-for r in range(size):
-    for c in range(size):
-        x = offset + c * cell_size
-        y = offset + r * cell_size
-        positions.append((x, y))
-
-# ==== SINH CONNECTIONS ====
-connections = []
-def index(r, c): return r * size + c
-
-for r in range(size):
-    for c in range(size):
-        i = index(r, c)
-        # phải
-        if c + 1 < size:
-            connections.append((i, index(r, c + 1)))
-        # xuống
-        if r + 1 < size:
-            connections.append((i, index(r + 1, c)))
-        # chéo nếu r + c chẵn
-        if (r + c) % 2 == 0:
-            if r + 1 < size and c + 1 < size:
-                connections.append((i, index(r + 1, c + 1)))
-            if r + 1 < size and c - 1 >= 0:
-                connections.append((i, index(r + 1, c - 1)))
-
-# ==== VẼ BoardGame ====
 def draw_board():
     screen.fill(WHITE)
-    # vẽ các line từ connections
-    for a, b in connections:
-        pygame.draw.line(screen, BLACK, positions[a], positions[b], 2)
 
-    # vẽ các điểm giao
-    for i, (x, y) in enumerate(positions):
-        pygame.draw.circle(screen, BLACK, (x, y), 6)
-    
-    # ✅ Sử dụng lock khi đọc pieces
-    with pieces_lock:
-        for p in pieces:
-            x, y = positions[p["pos"]]
-            pygame.draw.circle(screen, p["color"], (x, y), 22)
-            if p == selected_piece:
-                pygame.draw.circle(screen, GREEN, (x, y), 26, 3)
-    
-    pygame.display.flip()
+    # Header Uniform Style
+    pygame.draw.rect(screen, PANEL, (0, 0, WIDTH, header_h))
 
-def get_piece_at_pos(mouse_pos):
-    # ✅ Sử dụng lock khi đọc pieces
-    with pieces_lock:
-        for p in pieces:
-            x, y = positions[p["pos"]]
-            if (mouse_pos[0]-x)**2 + (mouse_pos[1]-y)**2 < 22**2:
-                return p
-    return None
+    # Title
+    title = title_f.render("CỜ GÁNH", True, BLACK)
+    screen.blit(title, title.get_rect(center=(WIDTH // 2, 28)))
 
-def is_connected(pos1, pos2):
-    return (pos1, pos2) in connections or (pos2, pos1) in connections
+    # Status Line
+    turn_str = "RED" if game.turn == TOKEN_RED else "BLUE"
+    p_str = "RED"  # Client 1 is RED
 
-# ==== MAIN LOOP ====
-clock = pygame.time.Clock()
+    # Render status text
+    sub = tiny.render(f"Lượt: {turn_str}   |   Bạn: {p_str}", True, MUTED)
+    screen.blit(sub, sub.get_rect(center=(WIDTH // 2, 58)))
+
+    # Draw Lines
+    for i in range(SIZE * SIZE):
+        for j in game.neighbors[i]:
+            if i < j:
+                pygame.draw.line(screen, BLACK, positions[i], positions[j], 2)
+
+    # Draw Pieces
+    with game_lock:
+        for i, (x, y) in enumerate(positions):
+            pygame.draw.circle(screen, BLACK, (x, y), 6)  # Dot
+
+            piece = game.board[i]
+            if piece == TOKEN_RED:
+                pygame.draw.circle(screen, RED_COLOR, (x, y), 24)
+            elif piece == TOKEN_BLUE:
+                pygame.draw.circle(screen, BLUE_COLOR, (x, y), 24)
+
+            # Highlight selection
+            if i == selected_node:
+                pygame.draw.circle(screen, GREEN, (x, y), 28, 3)
+
+
+def handle_click(pos):
+    global selected_node
+    mx, my = pos
+
+    clicked_idx = -1
+    for i, (px, py) in enumerate(positions):
+        if (mx - px) ** 2 + (my - py) ** 2 <= 24**2:
+            clicked_idx = i
+            break
+
+    if clicked_idx == -1:
+        selected_node = None
+        return
+
+    with game_lock:
+        if selected_node is None:
+            if game.board[clicked_idx] == local_token:
+                selected_node = clicked_idx
+        else:
+            start = selected_node
+            end = clicked_idx
+
+            if (
+                game.turn == local_token
+                and game.board[end] == EMPTY
+                and end in game.neighbors[start]
+            ):
+
+                game.apply_move(start, end, local_token)
+                game.turn = TOKEN_BLUE
+
+                payload = {"from": start, "to": end, "color": local_token}
+                try:
+                    sock.sendall(json.dumps(payload).encode())
+                    print(f"[SENT] {payload}")
+                except:
+                    print("Send failed")
+
+                selected_node = None
+            elif game.board[end] == local_token:
+                selected_node = end
+            else:
+                selected_node = None
+
+
 while True:
     draw_board()
+
+    winner, reason = game.check_winner()
+    if winner:
+        # Simple result overlay
+        res_text = f"THẮNG: {'RED' if winner == TOKEN_RED else 'BLUE'}"
+        res_surf = font_b.render(res_text, True, GREEN)
+        screen.blit(res_surf, res_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
+            sock.close()
             pygame.quit()
             sys.exit()
-
         elif event.type == pygame.MOUSEBUTTONDOWN:
-            # ✅ Sử dụng lock khi kiểm tra turn
-            with turn_lock:
-                current_turn = turn["color"]
-            
-            if current_turn != local_color:
-                continue  # không đến lượt mình
+            if event.button == 1:
+                handle_click(event.pos)
 
-            mouse_pos = pygame.mouse.get_pos()
-            clicked_piece = get_piece_at_pos(mouse_pos)
-
-            if selected_piece:
-                # thử di chuyển
-                for i, (x, y) in enumerate(positions):
-                    if (mouse_pos[0]-x)**2 + (mouse_pos[1]-y)**2 < 22**2:
-                        # ✅ Kiểm tra ô trống với lock
-                        with pieces_lock:
-                            occupied = any(p["pos"] == i for p in pieces)
-                        
-                        if not occupied and is_connected(selected_piece["pos"], i):
-                            old_pos = selected_piece["pos"]
-                            
-                            # ✅ Cập nhật vị trí với lock
-                            with pieces_lock:
-                                selected_piece["pos"] = i
-                            
-                            next_turn = RED if current_turn == BLUE else BLUE
-
-                            move = {"from": old_pos, "to": i, "next_turn": list(next_turn)}  # ✅ Chuyển tuple sang list để JSON serialize
-                            
-                            try:
-                                sock.sendall(json.dumps(move).encode())
-                                print(f"[SEND] {move}")
-                                
-                                # ✅ Cập nhật turn với lock
-                                with turn_lock:
-                                    turn["color"] = next_turn
-                            except Exception as e:
-                                print(f"[SEND ERROR] {e}")
-                        
-                        selected_piece = None
-                        break
-            else:
-                if clicked_piece and clicked_piece["color"] == local_color:
-                    selected_piece = clicked_piece
-    
-    clock.tick(60)  # ✅ Giới hạn FPS để giảm tải CPU
+    pygame.display.flip()
+    clock.tick(60)
